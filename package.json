@@ -1,0 +1,6 @@
+{
+  "name": "payme-webhook",
+  "private": true,
+  "type": "module",
+  "dependencies": { "nodemailer": "^6.9.14" }
+}
