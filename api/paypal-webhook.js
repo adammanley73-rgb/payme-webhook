@@ -21,6 +21,7 @@ export default async function handler(req, res) {
       ? req.body
       : (await readJsonBody(req));
 
+    // 1) OAuth for Bearer token
     const tokenResp = await fetch(`${process.env.PAYPAL_BASE}/v1/oauth2/token`, {
       method: 'POST',
       headers: {
@@ -37,6 +38,17 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:'OAuth failed', details: tokenData });
     }
 
+    // 1a) Extra diagnostics
+    console.log('OAuth app_id/scope', { app_id: tokenData.app_id, scope: tokenData.scope });
+
+    const hookLookup = await fetch(
+      `${process.env.PAYPAL_BASE}/v1/notifications/webhooks/${process.env.PAYPAL_WEBHOOK_ID}`,
+      { headers: { 'Authorization': `Bearer ${tokenData.access_token}` } }
+    );
+    const hookJson = await hookLookup.json();
+    console.log('Webhook lookup', hookLookup.status, hookJson);
+
+    // 2) Verify signature
     const verifyResp = await fetch(`${process.env.PAYPAL_BASE}/v1/notifications/verify-webhook-signature`, {
       method: 'POST',
       headers: {
