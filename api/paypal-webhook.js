@@ -7,7 +7,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 0) Required PayPal headers
+    // --- 0) Required PayPal headers ---
     const h = req.headers;
     const transmissionId   = h['paypal-transmission-id'];
     const transmissionTime = h['paypal-transmission-time'];
@@ -16,14 +16,13 @@ export default async function handler(req, res) {
     const transmissionSig  = h['paypal-transmission-sig'];
 
     if (!transmissionId || !transmissionTime || !certUrl || !authAlgo || !transmissionSig) {
-      console.log('Missing PayPal headers', { transmissionId, transmissionTime, certUrl, authAlgo, transmissionSig });
       return res.status(400).json({ ok:false, error:'Missing PayPal signature headers' });
     }
 
-    // Read JSON body (supports both parsed and raw)
-    const bodyObj = typeof req.body === 'object' && req.body ? req.body : (await readJsonBody(req));
+    // Support both parsed and raw JSON
+    const bodyObj = (typeof req.body === 'object' && req.body) ? req.body : await readJsonBody(req);
 
-    // 1) OAuth (Bearer token)
+    // --- 1) OAuth (Sandbox base must be https://api-m.sandbox.paypal.com) ---
     const tokenResp = await fetch(`${process.env.PAYPAL_BASE}/v1/oauth2/token`, {
       method: 'POST',
       headers: {
@@ -40,7 +39,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:'OAuth failed', details: tokenData });
     }
 
-    // 2) Verify webhook signature
+    // --- 2) Verify PayPal signature ---
     const verifyResp = await fetch(`${process.env.PAYPAL_BASE}/v1/notifications/verify-webhook-signature`, {
       method: 'POST',
       headers: {
@@ -64,114 +63,86 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:'Invalid signature', details: verifyData });
     }
 
-    // 3) Idempotency guard
+    // --- 3) Idempotency guard (dedupe by event id) ---
     try {
-      const evtId = bodyObj?.id;
+      const evtId = bodyObj?.id; // PayPal event id, like WH-XXXX
       if (evtId) {
         const seen = await kv.get(`pp:${evtId}`);
-        if (seen) return res.status(200).json({ ok: true, deduped: true });
-        await kv.set(`pp:${evtId}`, 1, { ex: 60 * 60 * 24 * 14 }); // 14 days
+        if (seen) {
+          return res.status(200).json({ ok: true, deduped: true });
+        }
+        // keep dedupe markers for 14 days
+        await kv.set(`pp:${evtId}`, 1, { ex: 60 * 60 * 24 * 14 });
       }
     } catch (e) {
       console.warn('KV guard error (continuing):', e?.message || e);
     }
 
-    // 4) Business logic
+    // --- 4) Handle events and write business keys to KV ---
     const type = bodyObj?.event_type;
-    const r = bodyObj?.resource ?? {};
-    switch (type) {
-      case 'PAYMENT.CAPTURE.COMPLETED':
-        await handleCaptureCompleted(r);
-        console.log('Handled capture completed:', r?.id);
-        break;
+    const r    = bodyObj?.resource || {};
 
-      case 'PAYMENT.CAPTURE.REFUNDED':
-        await handleCaptureRefunded(r);
-        console.log('Handled capture refunded:', r?.id);
-        break;
+    if (type === 'PAYMENT.CAPTURE.COMPLETED') {
+      const captureId = r.id;
+      const amount    = r?.amount?.value;
+      const currency  = r?.amount?.currency_code;
+      const orderRef  = r?.custom_id || r?.invoice_id || bodyObj?.summary;
 
-      case 'BILLING.SUBSCRIPTION.CANCELLED':
-        await handleSubscriptionCancelled(r);
-        console.log('Handled subscription cancelled:', r?.id);
-        break;
+      const payload = {
+        type,
+        captureId,
+        amount,
+        currency,
+        orderRef,
+        status: r?.status,
+        ts: bodyObj?.create_time,
+      };
 
-      default:
-        // Accept but don’t act on other events
-        console.log('Unhandled event type:', type);
-        break;
+      await kv.set(`pp:cap:${captureId}`, JSON.stringify(payload), { ex: 60 * 60 * 24 * 30 }); // 30 days
+      console.log(`Handled capture completed: ${captureId}`, payload);
+    }
+    else if (type === 'PAYMENT.CAPTURE.REFUNDED') {
+      // resource.id here is the REFUND id
+      const refundId  = r.id;
+      const amount    = r?.amount?.value;
+      const currency  = r?.amount?.currency_code;
+      const note      = bodyObj?.summary;
+
+      const payload = {
+        type,
+        refundId,
+        amount,
+        currency,
+        note,
+        status: r?.status,
+        ts: bodyObj?.create_time,
+      };
+
+      await kv.set(`pp:refund:${refundId}`, JSON.stringify(payload), { ex: 60 * 60 * 24 * 30 });
+      console.log(`Handled capture refunded: ${refundId}`, payload);
+    }
+    else if (type === 'BILLING.SUBSCRIPTION.CANCELLED') {
+      const subId     = r.id;
+      const reason    = r?.cancellation_effective_date || bodyObj?.summary;
+
+      const payload = {
+        type,
+        subscriptionId: subId,
+        reason,
+        ts: bodyObj?.create_time,
+      };
+
+      await kv.set(`pp:sub:${subId}`, JSON.stringify(payload), { ex: 60 * 60 * 24 * 30 });
+      console.log(`Handled subscription cancelled: ${subId}`, payload);
+    } else {
+      // Verified but unhandled — still acknowledge so PayPal stops retrying
+      console.log('Verified, unhandled event:', type);
     }
 
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('Webhook error', err);
     return res.status(500).json({ ok:false, error:'Server error' });
-  }
-}
-
-async function handleCaptureCompleted(resource) {
-  const captureId = resource?.id;
-  const amount    = resource?.amount?.value;
-  const currency  = resource?.amount?.currency_code;
-  const orderRef  = resource?.custom_id
-                 ?? resource?.invoice_id
-                 ?? resource?.supplementary_data?.related_ids?.order_id
-                 ?? null;
-
-  if (!captureId) return;
-
-  // Store a simple ledger record
-  try {
-    await kv.hset(`pp:cap:${captureId}`, {
-      status: 'paid',
-      amount,
-      currency,
-      orderRef,
-      ts: Date.now()
-    });
-  } catch (e) {
-    console.warn('KV write error (capture):', e?.message || e);
-  }
-}
-
-async function handleCaptureRefunded(resource) {
-  const refundId  = resource?.id;
-  const amount    = resource?.amount?.value;
-  const currency  = resource?.amount?.currency_code;
-
-  // Try to find the capture id from links or related ids
-  const captureIdFromLink = resource?.links?.find(l => l?.rel === 'up')?.href?.split('/')?.pop();
-  const captureIdRelated  = resource?.supplementary_data?.related_ids?.capture_id;
-  const captureId = captureIdFromLink || captureIdRelated || null;
-
-  if (!refundId) return;
-
-  try {
-    await kv.hset(`pp:refund:${refundId}`, {
-      status: 'refunded',
-      amount,
-      currency,
-      captureId,
-      ts: Date.now()
-    });
-    if (captureId) {
-      await kv.hset(`pp:cap:${captureId}`, { refunded: 'yes', refundId });
-    }
-  } catch (e) {
-    console.warn('KV write error (refund):', e?.message || e);
-  }
-}
-
-async function handleSubscriptionCancelled(resource) {
-  const subId = resource?.id;
-  if (!subId) return;
-
-  try {
-    await kv.hset(`pp:sub:${subId}`, {
-      status: 'cancelled',
-      ts: Date.now()
-    });
-  } catch (e) {
-    console.warn('KV write error (sub cancel):', e?.message || e);
   }
 }
 
