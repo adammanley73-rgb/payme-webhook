@@ -7,7 +7,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 0) Required PayPal headers
+    // 0) PayPal headers (Node lowercases them)
     const h = req.headers;
     const transmissionId   = h['paypal-transmission-id'];
     const transmissionTime = h['paypal-transmission-time'];
@@ -20,12 +20,12 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:'Missing PayPal signature headers' });
     }
 
-    // Read JSON body (supports both parsed and raw)
+    // Body (works whether bodyParser ran or not)
     const bodyObj = typeof req.body === 'object' && req.body
       ? req.body
       : (await readJsonBody(req));
 
-    // 1) OAuth (Bearer token)
+    // 1) OAuth
     const tokenResp = await fetch(`${process.env.PAYPAL_BASE}/v1/oauth2/token`, {
       method: 'POST',
       headers: {
@@ -42,7 +42,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:'OAuth failed', details: tokenData });
     }
 
-    // 2) Ask PayPal to verify the webhook signature
+    // 2) Verify signature
     const verifyResp = await fetch(`${process.env.PAYPAL_BASE}/v1/notifications/verify-webhook-signature`, {
       method: 'POST',
       headers: {
@@ -66,7 +66,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:'Invalid signature', details: verifyData });
     }
 
-    // 3) Idempotency guard (dedupe retries)
+    // 3) Idempotency guard (KV)
     try {
       const evtId = bodyObj?.id;
       if (evtId) {
@@ -77,14 +77,53 @@ export default async function handler(req, res) {
         await kv.set(`pp:${evtId}`, 1, { ex: 60 * 60 * 24 * 14 }); // 14 days
       }
     } catch (e) {
-      // Don’t fail the webhook if KV is momentarily unavailable
       console.warn('KV guard error (continuing):', e?.message || e);
     }
 
-    // 4) Process the verified event (add real handling later)
-    console.log('Event received:', bodyObj.event_type, bodyObj?.resource?.id);
+    // 4) Business logic
+    const eventType = bodyObj?.event_type;
+    const r = bodyObj?.resource || {};
+    console.log('Event received:', eventType, r?.id);
 
-    // TODO: branch on bodyObj.event_type and run your business logic
+    switch (eventType) {
+      case 'PAYMENT.CAPTURE.COMPLETED': {
+        const captureId = r.id;
+        const amount    = r.amount?.value;
+        const currency  = r.amount?.currency_code;
+        const orderRef  = r.custom_id || r.invoice_id || bodyObj.summary || captureId;
+
+        // TODO: mark order paid, trigger fulfilment
+        console.log('Paid:', { captureId, amount, currency, orderRef });
+        break;
+      }
+
+      case 'PAYMENT.CAPTURE.REFUNDED': {
+        const refundId  = r.id;
+        const captureId =
+          r.seller_payable_breakdown?.related_ids?.capture_id ||
+          r.supplementary_data?.related_ids?.capture_id;
+        const amount   = r.amount?.value;
+        const currency = r.amount?.currency_code;
+
+        // TODO: mark refund in your system
+        console.log('Refunded:', { refundId, captureId, amount, currency });
+        break;
+      }
+
+      case 'BILLING.SUBSCRIPTION.CANCELLED': {
+        const subId  = r.id;
+        const reason = r.status_change_note || 'cancelled';
+
+        // TODO: end subscription in your system
+        console.log('Subscription cancelled:', { subId, reason });
+        break;
+      }
+
+      default: {
+        // Return 200 so PayPal stops retrying unhandled but valid events
+        console.log('Unhandled event:', eventType);
+      }
+    }
 
     return res.status(200).json({ ok: true });
 
